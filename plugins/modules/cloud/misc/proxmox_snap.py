@@ -49,7 +49,7 @@ options:
   state:
     description:
      - Indicate desired state of the instance snapshot.
-    choices: ['present', 'absent']
+    choices: ['present', 'absent', 'rollback']
     default: present
     type: str
   force:
@@ -102,6 +102,15 @@ EXAMPLES = r'''
     api_host: node1
     vmid: 100
     state: absent
+    snapname: pre-updates
+
+- name: Rollback container snapshot
+  community.general.proxmox_snap:
+    api_user: root@pam
+    api_password: 1q2w3e
+    api_host: node1
+    vmid: 100
+    state: rollback
     snapname: pre-updates
 '''
 
@@ -172,6 +181,24 @@ def snapshot_remove(module, proxmox, vm, vmid, timeout, snapname, force):
     return False
 
 
+def snapshot_rollback(module, proxmox, vm, vmid, timeout, snapname):
+    if module.check_mode:
+        return True
+
+    taskid = getattr(proxmox.nodes(vm[0]['node']), VZ_TYPE)(vmid).snapshot(snapname).post("rollback")
+    while timeout:
+        if (proxmox.nodes(vm[0]['node']).tasks(taskid).status.get()['status'] == 'stopped' and
+                proxmox.nodes(vm[0]['node']).tasks(taskid).status.get()['exitstatus'] == 'OK'):
+            return True
+        timeout -= 1
+        if timeout == 0:
+            module.fail_json(msg='Reached timeout while waiting for rolling back VM snapshot. Last line in task before timeout: %s' %
+                                  proxmox.nodes(vm[0]['node']).tasks(taskid).log.get()[:1])
+
+        time.sleep(1)
+    return False
+
+
 def setup_api(api_host, api_user, api_password, validate_certs):
     api = ProxmoxAPI(api_host, user=api_user, password=api_password, verify_ssl=validate_certs)
     return api
@@ -187,7 +214,7 @@ def main():
             validate_certs=dict(type='bool', default='no'),
             hostname=dict(),
             timeout=dict(type='int', default=30),
-            state=dict(default='present', choices=['present', 'absent']),
+            state=dict(default='present', choices=['present', 'absent', 'rollback']),
             description=dict(type='str'),
             snapname=dict(type='str', default='ansible_snap'),
             force=dict(type='bool', default='no'),
@@ -276,6 +303,26 @@ def main():
 
         except Exception as e:
             module.fail_json(msg="Removing snapshot %s of VM %s failed with exception: %s" % (snapname, vmid, to_native(e)))
+    elif state == 'rollback':
+        try:
+            snap_exist = False
+
+            for i in proxmox.snapshot(vm, vmid).get():
+                if i['name'] == snapname:
+                    snap_exist = True
+                    continue
+
+            if not snap_exist:
+                module.exit_json(changed=False, msg="Snapshot %s does not exist" % snapname)
+            else:
+                if proxmox.snapshot_rollback(vm, vmid, timeout, snapname):
+                    if module.check_mode:
+                        module.exit_json(changed=False, msg="Snapshot %s would be rolled back" % snapname)
+                    else:
+                        module.exit_json(changed=True, msg="Snapshot %s rolled back" % snapname)
+
+        except Exception as e:
+            module.fail_json(msg="Rollback of snapshot %s of VM %s failed with exception: %s" % (snapname, vmid, to_native(e)))
 
 
 if __name__ == '__main__':
